@@ -24,7 +24,12 @@ import { Hono } from 'hono';
 import { getSandbox, Sandbox, type SandboxOptions } from '@cloudflare/sandbox';
 
 import type { AppEnv, MoltbotEnv } from './types';
-import { MOLTBOT_PORT } from './config';
+import {
+  MOLTBOT_PORT,
+  GATEWAY_REQUEST_TIMEOUT_MS,
+  CONTAINER_FETCH_TIMEOUT_MS,
+  CRON_TIMEOUT_MS,
+} from './config';
 import { createAccessMiddleware } from './auth';
 import { ensureMoltbotGateway, findExistingMoltbotProcess, syncToR2 } from './gateway';
 import { publicRoutes, api, adminUi, debug, cdp } from './routes';
@@ -48,6 +53,18 @@ function transformErrorMessage(message: string, host: string): string {
 }
 
 export { Sandbox };
+
+/**
+ * Race a promise against a timeout. Rejects with a descriptive error if the timeout wins.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms),
+    ),
+  ]);
+}
 
 /**
  * Validate required environment variables.
@@ -105,13 +122,18 @@ function validateRequiredEnv(env: MoltbotEnv): string[] {
 function buildSandboxOptions(env: MoltbotEnv): SandboxOptions {
   const sleepAfter = env.SANDBOX_SLEEP_AFTER?.toLowerCase() || 'never';
 
+  const containerTimeouts = {
+    instanceGetTimeoutMS: 15_000,
+    portReadyTimeoutMS: 30_000,
+  };
+
   // 'never' means keep the container alive indefinitely
   if (sleepAfter === 'never') {
-    return { keepAlive: true };
+    return { keepAlive: true, containerTimeouts };
   }
 
   // Otherwise, use the specified duration
-  return { sleepAfter };
+  return { sleepAfter, containerTimeouts };
 }
 
 // Main app
@@ -255,9 +277,13 @@ app.all('*', async (c) => {
     return c.html(loadingPageHtml);
   }
 
-  // Ensure moltbot is running (this will wait for startup)
+  // Ensure moltbot is running (hard timeout prevents DO death spiral)
   try {
-    await ensureMoltbotGateway(sandbox, c.env);
+    await withTimeout(
+      ensureMoltbotGateway(sandbox, c.env),
+      GATEWAY_REQUEST_TIMEOUT_MS,
+      'Gateway startup',
+    );
   } catch (error) {
     console.error('[PROXY] Failed to start Moltbot:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -429,19 +455,35 @@ app.all('*', async (c) => {
   }
 
   console.log('[HTTP] Proxying:', url.pathname + url.search);
-  const httpResponse = await sandbox.containerFetch(request, MOLTBOT_PORT);
-  console.log('[HTTP] Response status:', httpResponse.status);
+  try {
+    const httpResponse = await withTimeout(
+      sandbox.containerFetch(request, MOLTBOT_PORT),
+      CONTAINER_FETCH_TIMEOUT_MS,
+      'Container fetch',
+    );
+    console.log('[HTTP] Response status:', httpResponse.status);
 
-  // Add debug header to verify worker handled the request
-  const newHeaders = new Headers(httpResponse.headers);
-  newHeaders.set('X-Worker-Debug', 'proxy-to-moltbot');
-  newHeaders.set('X-Debug-Path', url.pathname);
+    // Add debug header to verify worker handled the request
+    const newHeaders = new Headers(httpResponse.headers);
+    newHeaders.set('X-Worker-Debug', 'proxy-to-moltbot');
+    newHeaders.set('X-Debug-Path', url.pathname);
 
-  return new Response(httpResponse.body, {
-    status: httpResponse.status,
-    statusText: httpResponse.statusText,
-    headers: newHeaders,
-  });
+    return new Response(httpResponse.body, {
+      status: httpResponse.status,
+      statusText: httpResponse.statusText,
+      headers: newHeaders,
+    });
+  } catch (error) {
+    console.error('[HTTP] Proxy failed:', error);
+    return c.json(
+      {
+        error: 'Gateway request failed',
+        details: error instanceof Error ? error.message : 'Unknown error',
+        hint: 'The container may be unresponsive. Try refreshing.',
+      },
+      504,
+    );
+  }
 });
 
 /**
@@ -456,19 +498,34 @@ async function scheduled(
   const options = buildSandboxOptions(env);
   const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
 
-  const gatewayProcess = await findExistingMoltbotProcess(sandbox);
+  let gatewayProcess;
+  try {
+    gatewayProcess = await withTimeout(
+      findExistingMoltbotProcess(sandbox),
+      CRON_TIMEOUT_MS,
+      'Cron listProcesses',
+    );
+  } catch (error) {
+    console.error('[cron] Failed to check gateway status:', error);
+    return;
+  }
+
   if (!gatewayProcess) {
     console.log('[cron] Gateway not running yet, skipping sync');
     return;
   }
 
   console.log('[cron] Starting backup sync to R2...');
-  const result = await syncToR2(sandbox, env);
+  try {
+    const result = await withTimeout(syncToR2(sandbox, env), CRON_TIMEOUT_MS * 4, 'Cron sync');
 
-  if (result.success) {
-    console.log('[cron] Backup sync completed successfully at', result.lastSync);
-  } else {
-    console.error('[cron] Backup sync failed:', result.error, result.details || '');
+    if (result.success) {
+      console.log('[cron] Backup sync completed successfully at', result.lastSync);
+    } else {
+      console.error('[cron] Backup sync failed:', result.error, result.details || '');
+    }
+  } catch (error) {
+    console.error('[cron] Sync timed out:', error);
   }
 }
 
