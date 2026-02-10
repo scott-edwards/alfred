@@ -112,8 +112,14 @@ function validateRequiredEnv(env: MoltbotEnv): string[] {
  * Build sandbox options based on environment configuration.
  *
  * SANDBOX_SLEEP_AFTER controls how long the container stays alive after inactivity:
- * - 'never' (default): Container stays alive indefinitely (recommended due to long cold starts)
+ * - 'never' (default): Uses a very long sleepAfter (4h) instead of keepAlive: true
  * - Duration string: e.g., '10m', '1h', '30s' - container sleeps after this period of inactivity
+ *
+ * NOTE: We intentionally avoid `keepAlive: true` because the SDK's internal alarm handler
+ * has a 180-second timeout. When the container dies, the alarm blocks the DO's single-threaded
+ * event loop for 180s per attempt, creating a death spiral that prevents all user requests
+ * from getting through to restart the container. Using `sleepAfter` avoids this by not
+ * continuously pinging a dead container.
  *
  * To reduce costs at the expense of cold start latency, set SANDBOX_SLEEP_AFTER to a duration:
  *   npx wrangler secret put SANDBOX_SLEEP_AFTER
@@ -127,9 +133,10 @@ function buildSandboxOptions(env: MoltbotEnv): SandboxOptions {
     portReadyTimeoutMS: 30_000,
   };
 
-  // 'never' means keep the container alive indefinitely
+  // 'never' means use a very long sleepAfter to keep the container alive effectively indefinitely
+  // while avoiding the keepAlive alarm death spiral when the container crashes
   if (sleepAfter === 'never') {
-    return { keepAlive: true, containerTimeouts };
+    return { sleepAfter: '4h', containerTimeouts };
   }
 
   // Otherwise, use the specified duration
