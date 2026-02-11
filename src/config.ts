@@ -14,12 +14,6 @@ export const GATEWAY_REQUEST_TIMEOUT_MS = 30_000;
 /** Maximum time for containerFetch before aborting */
 export const CONTAINER_FETCH_TIMEOUT_MS = 60_000;
 
-/** Maximum time for the cron handler to wait for listProcesses */
-export const CRON_TIMEOUT_MS = 15_000;
-
-/** Mount path for R2 persistent storage inside the container */
-export const R2_MOUNT_PATH = '/data/moltbot';
-
 /**
  * R2 bucket name for persistent storage.
  * Can be overridden via R2_BUCKET_NAME env var for test isolation.
