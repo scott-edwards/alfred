@@ -163,7 +163,9 @@ app.use('*', async (c, next) => {
 // Middleware: Initialize sandbox for all requests
 app.use('*', async (c, next) => {
   const options = buildSandboxOptions(c.env);
-  const sandbox = getSandbox(c.env.Sandbox, 'moltbot', options);
+  // Use 'moltbot-v2' to create a fresh DO instance, abandoning the old one
+  // whose SQLite storage has keepAliveEnabled=true stuck in an alarm death spiral
+  const sandbox = getSandbox(c.env.Sandbox, 'moltbot-v2', options);
   c.set('sandbox', sandbox);
   await next();
 });
